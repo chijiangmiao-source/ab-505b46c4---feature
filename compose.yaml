@@ -1,0 +1,33 @@
+name: deep-space-ground-station
+
+services:
+  app:
+    build: ./app
+    environment:
+      PORT: "8080"
+      DB_PATH: /data/app.db
+    volumes:
+      - app-data:/data          # SQLite 持久化：重启后重放仍可恢复
+    ports:
+      - "${APP_HOST_PORT:-8080}:8080"   # 可配置宿主机端口，健康检查: GET /health
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  verify:
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:8080
+      APP_DIR: /acceptance/app
+    # 跑完单元测试 + 冒烟 + 三大场景 + 页面校验后退出，退出码即验收结果。
+
+volumes:
+  app-data:
