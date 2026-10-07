@@ -35,7 +35,7 @@ cp .env.example .env        # 可选：修改 APP_HOST_PORT（默认 8080）
 docker compose up -d --build app
 ```
 
-- 页面：<http://localhost:8080/>（创建授权族 / 发起轮换 / 状态查询 / 故障注入演练）
+- 页面：<http://localhost:8080/>（创建授权族 / 发起轮换 / 状态查询 / 轮换链审计 / 故障注入演练）
 - 健康检查：<http://localhost:8080/health>（端口由 `APP_HOST_PORT` 决定）
 
 数据持久化在命名卷 `app-data`（SQLite，WAL 模式），`docker compose restart app`
@@ -49,6 +49,7 @@ docker compose up -d --build app
 | POST | `/api/families` | 创建授权族 `{terminal_id}` → 201 `{credential, generation:1, family_status:"active"}` |
 | POST | `/api/rotate` | 轮换 `{terminal_id, credential, rotation_id}` → 200 `accepted/replayed`；409 `revoked`（含 `revocation_reason`）；401 无效凭证；404 未知终端 |
 | GET | `/api/terminals/<tid>/family` | 授权族状态（代次、状态、撤销原因） |
+| GET | `/api/terminals/<tid>/rotation-chain` | 轮换链审计：创建记录 + 每一次实际改变授权族的轮换/撤销记录（仅凭证指纹，未知终端 404） |
 | GET/POST | `/api/admin/faults` | 查看/设置故障注入 `{"drop_after_commit": bool}`（内存态，重启自动清除） |
 | POST | `/api/admin/shutdown` | 退出服务进程（守护循环自动拉起，用于重启演练） |
 
@@ -64,14 +65,27 @@ rotated        与首次不同         revoked：授权族撤销，记录重用�
 幂等键为 `(family_id, old_credential_hash, rotation_id)` 的唯一约束；
 写路径经进程级锁 + `BEGIN IMMEDIATE` 事务串行化，并发相同请求只会落一条轮换记录。
 
+### 轮换链审计语义
+
+值班员从授权族详情（状态查询卡片内的「轮换链审计 →」入口，或页面第 ⑤ 区）进入链路，
+按发生顺序核对，而非仅凭当前代次推断旧凭证是否已被正常替换：
+
+- **入链记录**：创建记录（代次 1）+ 每一次**实际改变授权族**的轮换（`accepted`）与撤销（`revocation`）。
+- **记录字段**：前/后凭证的不可逆指纹（`sha256:` + 哈希前 16 位）、稳定轮换标识、结果代次、记录状态、（撤销）原因与发生时刻。
+- **凭证脱敏**：`rotation_events` 与接口响应中**只有哈希/截断指纹，没有任何可用凭证明文**；明文仅存于业务 `rotations` 表供重放取回，不进入审计视图。
+- **重放不入链**：相同旧凭证 + 相同轮换标识的重放只回放业务结果，**不额外生成审计记录、不改变链路顺序**，服务重启后同样成立。
+- **撤销标记**：触发异标识重用的那条记录 `reuse_trigger=true`，链顶展示「全链失效」横幅；撤销不推进代次。
+- **未知终端**：`GET /api/terminals/<tid>/rotation-chain` 对未知终端返回 `404 {"error":"unknown_terminal"}`，不返回任何链路数据。
+
 ## verify 验收内容（退出码即结果）
 
-1. **代码测试**：`app/tests/` 下 12 项单元测试（创建/首轮换/重放/重启恢复/并发/撤销/错误路径）；
+1. **代码测试**：`app/tests/` 下 17 项单元测试（创建/首轮换/重放/重启恢复/并发/撤销/轮换链）；
 2. **API/HTTP 冒烟**：健康端点、建族、首轮换、页面可达；
 3. **场景 A 断回应恢复**：启用故障 → 首次请求连接中断 → 进程重启 → 原标识重传取回同一后继（`replayed`，代次 2 不再推进）→ 后继凭证仍可继续轮换；
 4. **场景 B 并发同标识**：两线程同时发起相同请求 → 同一凭证同一世代，恰一次 `accepted` 一次 `replayed`；
 5. **场景 C 异标识重放**：撤销 + 原因可见 + 后继凭证被拒 + 原重放亦被拒；
-6. **页面可观察结果**：页面包含「已接受/重放/已撤销/撤销原因/断回应」等呈现元素，且轮换响应字段与页面渲染一一对应。
+6. **场景 D 轮换链审计**：首轮换链（创建记录 + 指纹脱敏）→ 多轮换顺序延伸、相邻指纹首尾相接 → 重启前后链路逐字节一致 → 撤销记录标记重用触发与全链失效、代次不推进 → 撤销后拒绝不入链、全程无明文泄露 → 未知终端 404；
+7. **页面可观察结果**：页面包含「已接受/重放/已撤销/撤销原因/断回应/轮换链/全链失效/异标识重用」等呈现元素，且轮换响应字段、轮换链记录字段与页面渲染一一对应。
 
 ## 本地开发（无 Docker）
 

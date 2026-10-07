@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """深空地面站验收器（compose 中的 verify 服务）。
 
-围绕三项核心场景完成校验，并以退出码报告验收结果：
+围绕核心场景完成校验，并以退出码报告验收结果：
   A. 断回应恢复：提交后断连 → 重启 → 凭原标识恢复已持久化的后继，代次不再推进
   B. 并发同标识：两个并发相同请求只观察到同一结果
   C. 异标识重放：撤销授权族并给出原因，后继凭证随后同样被拒绝
+  D. 轮换链审计：创建 + 每一次实际改变授权族的记录按序可查，仅指纹不外泄凭证；
+     重放（含重启后）不入链；撤销记录标记异标识重用触发与全链失效；未知终端查询失败
 另含：代码单元测试、API/HTTP 冒烟、页面可观察结果校验。
 
 环境变量：
@@ -104,7 +106,7 @@ def create_family(terminal):
 # ---------------------------------------------------------------- 单元测试
 
 def step_unit_tests():
-    print("\n== 1/6 代码单元测试 ==", flush=True)
+    print("\n== 1/7 代码单元测试 ==", flush=True)
     tests_dir = os.path.join(APP_DIR, "tests")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", tests_dir, "-v"],
@@ -118,7 +120,7 @@ def step_unit_tests():
 # ---------------------------------------------------------------- 冒烟
 
 def step_smoke():
-    print("\n== 2/6 API/HTTP 冒烟 ==", flush=True)
+    print("\n== 2/7 API/HTTP 冒烟 ==", flush=True)
     try:
         status, body = req("GET", "/health")
         record("GET /health 返回健康", status == 200 and body.get("status") == "ok",
@@ -147,7 +149,7 @@ def step_smoke():
 # ------------------------------------------------------- 场景 A：断回应恢复
 
 def step_disconnect_recovery():
-    print("\n== 3/6 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
+    print("\n== 3/7 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
     terminal = f"term-drop-{SFX}"
     rid = f"rot-drop-{SFX}"
     status, fam = create_family(terminal)
@@ -201,7 +203,7 @@ def step_disconnect_recovery():
 # ------------------------------------------------------- 场景 B：并发同标识
 
 def step_concurrent_same_id():
-    print("\n== 4/6 场景 B：两个并发相同请求 ==", flush=True)
+    print("\n== 4/7 场景 B：两个并发相同请求 ==", flush=True)
     terminal = f"term-conc-{SFX}"
     rid = f"rot-conc-{SFX}"
     status, fam = create_family(terminal)
@@ -237,7 +239,7 @@ def step_concurrent_same_id():
 # ------------------------------------------------- 场景 C：异标识重放 → 撤销
 
 def step_reuse_revocation():
-    print("\n== 5/6 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
+    print("\n== 5/7 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
     terminal = f"term-reuse-{SFX}"
     status, fam = create_family(terminal)
     if status != 201:
@@ -271,10 +273,144 @@ def step_reuse_revocation():
     record("状态查询可见撤销状态与原因", ok, f"HTTP {status}")
 
 
+# ------------------------------------------- 场景 D：轮换链审计
+
+def step_rotation_chain_audit():
+    print("\n== 6/7 场景 D：轮换链审计（顺序 / 幂等 / 重启 / 撤销标记 / 脱敏） ==", flush=True)
+    chain_path = lambda t: f"/api/terminals/{t}/rotation-chain"
+
+    # 未知终端：明确的查询失败语义，不返回任何链路数据。
+    status, body = req("GET", chain_path(f"term-unknown-{SFX}"))
+    record("轮换链：未知终端返回 404 unknown_terminal",
+           status == 404 and body.get("error") == "unknown_terminal", f"HTTP {status} {body}")
+
+    terminal = f"term-chain-{SFX}"
+    status, fam = create_family(terminal)
+    if status != 201:
+        return record("场景D 前置：创建授权族", False, f"HTTP {status}")
+    cred0 = fam["credential"]
+
+    status, chain0 = req("GET", chain_path(terminal))
+    recs0 = chain0.get("records", [])
+    ok = (status == 200 and len(recs0) == 1 and recs0[0].get("type") == "creation"
+          and recs0[0].get("resulting_generation") == 1
+          and str(recs0[0].get("new_credential_fingerprint", "")).startswith("sha256:")
+          and chain0.get("family_status") == "active"
+          and chain0.get("chain_invalidated") is False
+          and cred0 not in json.dumps(chain0))
+    record("首轮换链：仅创建记录，初始凭证以指纹展示、无明文", ok, f"HTTP {status}")
+
+    rid1 = f"rot-chain-1-{SFX}"
+    status, r1 = rotate(terminal, cred0, rid1)
+    if not (status == 200 and r1.get("outcome") == "accepted"):
+        return record("场景D 首次轮换", False, f"HTTP {status} {r1}")
+    cred1 = r1["credential"]
+
+    # 多次同标识重放：只回放既有业务结果。
+    for _ in range(2):
+        s, rr = rotate(terminal, cred0, rid1)
+        if not (s == 200 and rr.get("outcome") == "replayed"
+                and rr.get("credential") == cred1 and rr.get("generation") == 2):
+            return record("场景D 重放保持既有结果", False, f"HTTP {s} {rr.get('outcome')}")
+
+    status, chain1 = req("GET", chain_path(terminal))
+    recs1 = chain1.get("records", [])
+    rotation_rec = recs1[1] if len(recs1) > 1 else {}
+    ok = (len(recs1) == 2
+          and [r.get("type") for r in recs1] == ["creation", "rotation"]
+          and [r.get("seq") for r in recs1] == [0, 1]
+          and rotation_rec.get("rotation_id") == rid1
+          and rotation_rec.get("resulting_generation") == 2
+          and rotation_rec.get("status") == "accepted"
+          and str(rotation_rec.get("old_credential_fingerprint", "")).startswith("sha256:")
+          and str(rotation_rec.get("new_credential_fingerprint", "")).startswith("sha256:")
+          and rotation_rec.get("old_credential_fingerprint")
+              == recs1[0].get("new_credential_fingerprint"))
+    record("首轮换链：重放不新增记录、顺序不变；轮换记录含前后指纹/稳定标识/结果代次/状态",
+           ok, f"{len(recs1)} 条记录")
+
+    # 第二次轮换，验证链路按发生顺序延伸且指纹首尾相接。
+    rid2 = f"rot-chain-2-{SFX}"
+    status, r2 = rotate(terminal, cred1, rid2)
+    if not (status == 200 and r2.get("outcome") == "accepted" and r2.get("generation") == 3):
+        return record("场景D 第二次轮换", False, f"HTTP {status}")
+    cred2 = r2["credential"]
+    status, chain2 = req("GET", chain_path(terminal))
+    recs2 = chain2.get("records", [])
+    ok = (len(recs2) == 3
+          and [r.get("rotation_id") for r in recs2[1:]] == [rid1, rid2]
+          and recs2[2].get("old_credential_fingerprint")
+              == recs2[1].get("new_credential_fingerprint")
+          and recs2[2].get("resulting_generation") == 3)
+    record("轮换链按发生顺序延伸，相邻记录后/前凭证指纹相接", ok)
+
+    # 重启后的幂等重放：业务结果一致，且审计链路与重启前逐字节一致。
+    before_restart = json.dumps(chain2, sort_keys=True)
+    try:
+        req("POST", "/api/admin/shutdown")
+    except Exception:
+        pass
+    record("场景D 服务进程已退出", wait_down(15))
+    record("场景D 服务进程重启后恢复健康", wait_health(30))
+    s, rr = rotate(terminal, cred1, rid2)
+    ok = (s == 200 and rr.get("outcome") == "replayed"
+          and rr.get("credential") == cred2 and rr.get("generation") == 3)
+    record("重启后相同（旧凭证, 轮换标识）重放只回放既有结果", ok, f"HTTP {s}")
+    s, rr = rotate(terminal, cred0, rid1)
+    record("重启后更早一代的重放同样只回放既有结果",
+           s == 200 and rr.get("outcome") == "replayed"
+           and rr.get("credential") == cred1 and rr.get("generation") == 2)
+    status, chain3 = req("GET", chain_path(terminal))
+    after_restart = json.dumps(chain3, sort_keys=True)
+    record("重启重放不额外生成审计记录、不改变链路顺序",
+           status == 200 and after_restart == before_restart
+           and len(chain3.get("records", [])) == 3)
+
+    # 异标识重用 → 撤销记录明确标记触发记录与全链失效。
+    rid_bad = f"rot-chain-DIFFERENT-{SFX}"
+    status, rb = rotate(terminal, cred0, rid_bad)
+    record("场景D 异标识重用触发撤销", status == 409 and rb.get("outcome") == "revoked",
+           f"HTTP {status}")
+    status, chain4 = req("GET", chain_path(terminal))
+    recs4 = chain4.get("records", [])
+    rev_rec = recs4[-1] if recs4 else {}
+    ok = (status == 200 and len(recs4) == 4
+          and chain4.get("family_status") == "revoked"
+          and chain4.get("chain_invalidated") is True
+          and chain4.get("reuse_trigger_seq") == rev_rec.get("seq") == 3
+          and rev_rec.get("type") == "revocation"
+          and rev_rec.get("reuse_trigger") is True
+          and rev_rec.get("rotation_id") == rid_bad
+          and rev_rec.get("status") == "revoked"
+          and rev_rec.get("resulting_generation") == 3   # 撤销不推进代次
+          and rev_rec.get("new_credential_fingerprint") is None
+          and "reuse" in (rev_rec.get("reason") or "")
+          and not any(r.get("reuse_trigger") for r in recs4[:-1]))
+    record("撤销记录标记异标识重用触发，全链失效状态与原因可见、代次不推进", ok)
+
+    # 撤销后的任何重放/尝试都不得再入链。
+    rotate(terminal, cred0, rid1)
+    rotate(terminal, cred1, rid2)
+    rotate(terminal, cred2, f"rot-chain-after-{SFX}")
+    status, chain5 = req("GET", chain_path(terminal))
+    record("撤销后拒绝的重放/轮换均不产生审计记录",
+           status == 200 and len(chain5.get("records", [])) == 4
+           and json.dumps(chain5, sort_keys=True) == json.dumps(chain4, sort_keys=True))
+
+    # 凭证脱敏：全链路 JSON 中不出现任何曾签发的可用凭证明文，只允许 sha256 指纹。
+    blob = json.dumps(chain5, ensure_ascii=False)
+    fps = [r.get("old_credential_fingerprint") for r in recs4] + \
+          [r.get("new_credential_fingerprint") for r in recs4]
+    fps = [f for f in fps if f]
+    no_leak = all(c not in blob for c in (cred0, cred1, cred2)) and not any(
+        f for f in fps if not str(f).startswith("sha256:"))
+    record("审计结果全程仅含不可逆指纹，不泄露可用凭证", no_leak)
+
+
 # ------------------------------------------------------- 页面可观察结果
 
 def step_page_observability():
-    print("\n== 6/6 页面可观察结果校验 ==", flush=True)
+    print("\n== 7/7 页面可观察结果校验 ==", flush=True)
     try:
         status, html = get_text("/")
     except Exception as e:
@@ -284,11 +420,13 @@ def step_page_observability():
     needles = [
         "深空地面站", "授权族", "终端标识", "轮换标识",
         "已接受", "重放", "已撤销", "撤销原因", "断回应",
+        "轮换链", "全链失效", "异标识重用",
         'id="rotate-result"', 'id="revocation-reason"',
         'id="create-result"', 'id="status-result"',
+        'id="chain-result"', 'id="chain-btn"', 'id="chain-invalidated"',
     ]
     missing = [n for n in needles if n not in html]
-    record("页面呈现接受/重放/撤销等可观察元素", not missing,
+    record("页面呈现接受/重放/撤销及轮换链审计等可观察元素", not missing,
            "缺失: " + ", ".join(missing) if missing else "全部命中")
 
     # 页面渲染所依赖的 API 字段齐备（与页面 JS 读取的字段一一对应）。
@@ -298,6 +436,18 @@ def step_page_observability():
     fields = {"outcome", "credential", "generation", "family_status", "family_id", "terminal_id"}
     record("轮换响应包含页面展示所需字段", fields <= set(rot.keys()),
            f"字段: {sorted(fields & set(rot.keys()))}")
+
+    _, chain = req("GET", f"/api/terminals/{terminal}/rotation-chain")
+    chain_fields = {"family_id", "terminal_id", "family_status", "generation",
+                    "chain_invalidated", "records"}
+    record_fields = {"seq", "type", "rotation_id", "old_credential_fingerprint",
+                     "new_credential_fingerprint", "resulting_generation",
+                     "status", "reason", "occurred_at", "reuse_trigger"}
+    record("轮换链响应包含页面渲染所需字段",
+           chain_fields <= set(chain.keys())
+           and bool(chain.get("records"))
+           and record_fields <= set(chain["records"][0].keys()),
+           f"{len(chain.get('records', []))} 条记录")
 
 
 # ---------------------------------------------------------------- main
@@ -317,6 +467,7 @@ def main():
         step_disconnect_recovery()
         step_concurrent_same_id()
         step_reuse_revocation()
+        step_rotation_chain_audit()
         step_page_observability()
 
     passed = sum(1 for _, ok in RESULTS if ok)

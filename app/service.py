@@ -7,6 +7,9 @@
   返回与首次完全一致的后继凭证与代次，结果标记为 replayed，代次不再推进。
 - 重用检测：已轮换的旧凭证搭配「不同」轮换标识再次出现，
   整个授权族立即撤销并记录原因；此前签发的后继凭证随之被拒绝。
+
+轮换链审计（get_rotation_chain）按发生顺序返回创建记录与每次实际改变授权族的
+轮换/撤销记录，仅暴露不可逆凭证指纹；幂等重放（含重启后）不产生审计记录。
 """
 import hashlib
 import secrets
@@ -43,6 +46,13 @@ def _hash(credential):
     return hashlib.sha256(credential.encode("utf-8")).hexdigest()
 
 
+def _fingerprint(credential_hash):
+    """审计展示用的不可逆指纹：仅取哈希前缀，凭证明文永不进入审计结果。"""
+    if credential_hash is None:
+        return None
+    return "sha256:" + credential_hash[:16]
+
+
 def _new_credential():
     return "rft_" + secrets.token_hex(24)
 
@@ -74,6 +84,7 @@ def create_family(storage, terminal_id):
             "credential": credential,
             "generation": 1,
             "family_status": STATUS_ACTIVE,
+            "created_at": now,
         }
 
 
@@ -101,6 +112,71 @@ def _family_view(family):
         "generation": family["generation"],
         "revocation_reason": family["revocation_reason"],
         "created_at": family["created_at"],
+    }
+
+
+def get_rotation_chain(storage, terminal_id):
+    """按代次/发生顺序返回授权族轮换链：创建记录 + 每一次实际改变授权族的记录。
+
+    审计结果只包含不可逆指纹（sha256 截断），不包含任何可用凭证明文；
+    幂等重放不产生记录，因此重放（含重启后）不会改变链路顺序与长度。
+    未知终端抛 UnknownTerminalError，由 HTTP 层映射为明确的查询失败。
+    """
+    terminal_id = (terminal_id or "").strip()
+    with storage.transaction() as db:
+        family = db.find_family_by_terminal(terminal_id)
+        if not family:
+            raise UnknownTerminalError(terminal_id)
+        cred_rows = db.list_credentials(family["family_id"])
+        events = db.list_rotation_events(family["family_id"])
+
+    # 创建记录：代次 1 的初始凭证指纹，来自凭证表（只存哈希，无明文）。
+    gen1 = next((c for c in cred_rows if c["generation"] == 1), None)
+    creation = {
+        "seq": 0,
+        "type": "creation",
+        "rotation_id": None,
+        "old_credential_fingerprint": None,
+        "new_credential_fingerprint": (
+            _fingerprint(gen1["credential_hash"]) if gen1 else None
+        ),
+        "resulting_generation": 1,
+        "status": "issued",
+        "reason": None,
+        "occurred_at": family["created_at"],
+        "reuse_trigger": False,
+    }
+
+    records = [creation]
+    reuse_trigger_seq = None
+    for idx, ev in enumerate(events, start=1):
+        record = {
+            "seq": idx,
+            "type": ev["event_type"],
+            "rotation_id": ev["rotation_id"],
+            "old_credential_fingerprint": _fingerprint(ev["old_credential_hash"]),
+            "new_credential_fingerprint": _fingerprint(ev["new_credential_hash"]),
+            "resulting_generation": ev["resulting_generation"],
+            "status": ev["status"],
+            "reason": ev["reason"],
+            "occurred_at": ev["created_at"],
+            "reuse_trigger": False,
+        }
+        if ev["event_type"] == "revocation" and reuse_trigger_seq is None:
+            record["reuse_trigger"] = True
+            reuse_trigger_seq = idx
+        records.append(record)
+
+    revoked = family["status"] == STATUS_REVOKED
+    return {
+        "family_id": family["family_id"],
+        "terminal_id": family["terminal_id"],
+        "family_status": family["status"],
+        "generation": family["generation"],
+        "revocation_reason": family["revocation_reason"],
+        "chain_invalidated": revoked,
+        "reuse_trigger_seq": reuse_trigger_seq,
+        "records": records,
     }
 
 
@@ -158,8 +234,19 @@ def _rotate_once(db, terminal_id, credential, rotation_id):
         f"{REASON_REUSE}: rotated credential of terminal '{terminal_id}' "
         f"presented again with a different rotation id"
     )
+    now = _now()
     db.revoke_family(family["family_id"], reason)
     db.revoke_all_credentials(family["family_id"])
+    # 审计：撤销同样实际改变了授权族，追加撤销记录并标记触发重用的轮换标识。
+    db.insert_rotation_event(
+        family["family_id"], "revocation", now,
+        rotation_id=rotation_id,
+        old_credential_hash=cred_hash,
+        new_credential_hash=None,
+        resulting_generation=family["generation"],
+        status="revoked",
+        reason=reason,
+    )
     return _revoked_result({
         **family,
         "status": STATUS_REVOKED,
@@ -180,6 +267,15 @@ def _accept_rotation(db, family, terminal_id, cred, cred_hash, rotation_id):
                            new_generation, now)
     except sqlite3.IntegrityError:
         raise ConcurrentRotation()
+    # 审计：接受轮换实际改变了授权族，追加一条轮换记录（仅指纹，不含明文）。
+    db.insert_rotation_event(
+        family["family_id"], "rotation", now,
+        rotation_id=rotation_id,
+        old_credential_hash=cred_hash,
+        new_credential_hash=_hash(new_credential),
+        resulting_generation=new_generation,
+        status="accepted",
+    )
     db.set_family_generation(family["family_id"], new_generation)
     return {
         "outcome": "accepted",

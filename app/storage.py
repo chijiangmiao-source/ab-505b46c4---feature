@@ -38,6 +38,25 @@ CREATE TABLE IF NOT EXISTS rotations (
     created_at          TEXT NOT NULL,
     UNIQUE (family_id, old_credential_hash, rotation_id)  -- 幂等约束
 );
+
+-- 轮换链审计：仅追加。只有「实际改变授权族」的动作才会落记录
+-- （接受轮换 / 异标识重用触发的撤销）；幂等重放不产生记录。
+-- 这里只保存不可逆哈希，审计结果永远无法还原可用凭证。
+CREATE TABLE IF NOT EXISTS rotation_events (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    family_id            TEXT NOT NULL REFERENCES families(family_id),
+    event_type           TEXT NOT NULL,                   -- rotation | revocation
+    rotation_id          TEXT,                             -- 触发记录提交时使用的稳定轮换标识
+    old_credential_hash  TEXT,                             -- 轮换前凭证指纹来源（撤销记录为被重用的旧凭证）
+    new_credential_hash  TEXT,                             -- 轮换后凭证指纹来源；撤销记录为 NULL
+    resulting_generation INTEGER,                          -- 结果代次；撤销时代次不推进
+    status               TEXT NOT NULL,                    -- accepted | revoked
+    reason               TEXT,
+    created_at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rotation_events_family
+    ON rotation_events (family_id, id);
 """
 
 
@@ -122,6 +141,13 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_credentials(self, family_id):
+        rows = self._conn.execute(
+            "SELECT * FROM credentials WHERE family_id = ? ORDER BY id ASC",
+            (family_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def set_credential_status(self, credential_id, status):
         self._conn.execute(
             "UPDATE credentials SET status = ? WHERE id = ?", (status, credential_id)
@@ -155,5 +181,34 @@ class Storage:
     def count_rotations(self, family_id):
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM rotations WHERE family_id = ?", (family_id,)
+        ).fetchone()
+        return row["n"]
+
+    # ---- rotation_events（轮换链审计，仅追加）----
+
+    def insert_rotation_event(self, family_id, event_type, created_at,
+                              rotation_id=None, old_credential_hash=None,
+                              new_credential_hash=None, resulting_generation=None,
+                              status=None, reason=None):
+        self._conn.execute(
+            "INSERT INTO rotation_events (family_id, event_type, rotation_id,"
+            " old_credential_hash, new_credential_hash, resulting_generation,"
+            " status, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (family_id, event_type, rotation_id, old_credential_hash,
+             new_credential_hash, resulting_generation, status, reason, created_at),
+        )
+
+    def list_rotation_events(self, family_id):
+        rows = self._conn.execute(
+            "SELECT * FROM rotation_events WHERE family_id = ? ORDER BY id ASC",
+            (family_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_rotation_events(self, family_id):
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM rotation_events WHERE family_id = ?",
+            (family_id,),
         ).fetchone()
         return row["n"]

@@ -5,8 +5,9 @@
   GET  /                              操作员页面
   GET  /health                        健康检查（宿主机端口可在 compose 中配置）
   POST /api/families                  创建绑定终端标识的授权族
-  GET  /api/terminals/<tid>/family    查询授权族状态（含撤销原因）
-  GET  /api/families/<family_id>      按授权族 ID 查询
+  GET  /api/terminals/<tid>/family         查询授权族状态（含撤销原因）
+  GET  /api/terminals/<tid>/rotation-chain 查询轮换链审计（按发生顺序，仅凭证指纹）
+  GET  /api/families/<family_id>           按授权族 ID 查询
   POST /api/rotate                    以旧凭证 + 稳定轮换标识发起轮换（幂等）
   GET  /api/admin/faults              查看故障注入开关
   POST /api/admin/faults              设置故障注入开关 {"drop_after_commit": bool}
@@ -103,11 +104,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply_family(service.get_family, parts[2])
         if len(parts) == 4 and parts[:2] == ["api", "terminals"] and parts[3] == "family":
             return self._reply_family(service.get_family_by_terminal, parts[2])
+        if len(parts) == 4 and parts[:2] == ["api", "terminals"] and parts[3] == "rotation-chain":
+            return self._reply_rotation_chain(parts[2])
         return self._send_json(404, {"error": "not_found"})
 
     def _reply_family(self, lookup, key):
         try:
             return self._send_json(200, lookup(STORAGE, key))
+        except service.UnknownTerminalError:
+            return self._send_json(404, {"error": "unknown_terminal"})
+
+    def _reply_rotation_chain(self, terminal_id):
+        try:
+            return self._send_json(200, service.get_rotation_chain(STORAGE, terminal_id))
         except service.UnknownTerminalError:
             return self._send_json(404, {"error": "unknown_terminal"})
 

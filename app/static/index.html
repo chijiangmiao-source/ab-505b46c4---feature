@@ -45,6 +45,8 @@
   .badge.replayed { background: rgba(56,189,248,.15); color: var(--replay); border: 1px solid var(--replay); }
   .badge.revoked  { background: rgba(248,113,113,.15); color: var(--bad); border: 1px solid var(--bad); }
   .badge.error    { background: rgba(251,191,36,.15); color: var(--warn); border: 1px solid var(--warn); }
+  .badge.invalid  { background: rgba(248,113,113,.2); color: var(--bad); border: 1px solid var(--bad); }
+  .badge.reuse    { background: rgba(251,191,24,.18); color: var(--warn); border: 1px solid var(--warn); }
   .kv { margin-top: 8px; line-height: 1.7; }
   .kv .k { color: var(--dim); display: inline-block; min-width: 96px; }
   .kv .v { color: var(--fg); }
@@ -53,6 +55,30 @@
   .hint { font-size: 12px; color: var(--dim); margin-top: 10px; line-height: 1.6; }
   .fault-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 13px; }
   #fault-state { font-size: 12px; color: var(--dim); }
+  /* 轮换链审计 */
+  .card.wide { grid-column: 1 / -1; }
+  .chain-banner { display: none; margin: 4px 0 14px; padding: 10px 14px; border-radius: 8px;
+                  font-size: 13px; border: 1px solid var(--bad); background: rgba(248,113,113,.12); color: var(--bad); }
+  .chain-banner.show { display: block; }
+  .chain-banner .k { color: var(--fg); }
+  .chain-meta { font-size: 12px; color: var(--dim); margin-bottom: 10px; line-height: 1.8; }
+  .timeline { list-style: none; margin: 0; padding: 0; }
+  .timeline > li { position: relative; padding: 0 0 14px 26px; border-left: 2px solid var(--line); margin-left: 8px; }
+  .timeline > li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  .timeline > li::before {
+    content: ""; position: absolute; left: -7px; top: 2px; width: 12px; height: 12px;
+    border-radius: 50%; background: var(--panel2); border: 2px solid var(--accent);
+  }
+  .timeline > li.revoked::before { border-color: var(--bad); background: rgba(248,113,113,.25); }
+  .timeline .ev-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13px; }
+  .timeline .seq { color: var(--dim); font-size: 12px; min-width: 34px; }
+  .timeline .ev-time { color: var(--dim); font-size: 11px; }
+  .timeline .ev-body { margin-top: 5px; font-size: 12px; line-height: 1.8; color: var(--fg);
+                       background: var(--panel2); border: 1px solid var(--line);
+                       border-radius: 7px; padding: 8px 12px; }
+  .timeline .fp { color: var(--replay); word-break: break-all; }
+  .timeline .tag-reuse { color: var(--warn); font-weight: 700; }
+  .timeline .tag-reason { color: var(--bad); word-break: break-all; }
 </style>
 </head>
 <body>
@@ -105,6 +131,18 @@
     <div class="hint">
       启用「断回应」后，轮换请求会在<strong>提交成功后丢弃响应</strong>；重启服务再以相同参数重传，
       可恢复已持久化的后继凭证且代次不再推进。故障开关为内存态，重启后自动清除。
+    </div>
+  </section>
+
+  <section class="card wide">
+    <h2>⑤ 轮换链审计（从授权族详情进入，按发生顺序）</h2>
+    <label for="terminal-chain">终端标识 terminal_id</label>
+    <input type="text" id="terminal-chain" placeholder="terminal-alpha-01">
+    <button id="chain-btn">查看轮换链</button>
+    <div class="result" id="chain-result"></div>
+    <div class="hint">
+      链路含创建记录及每一次实际改变授权族的轮换 / 撤销记录，仅展示前后凭证的不可逆指纹（sha256 截断），
+      不泄露任何可用凭证。幂等重放（含重启后）只回放既有结果，不新增记录、不改变顺序。
     </div>
   </section>
 </div>
@@ -209,9 +247,96 @@ $("status-btn").onclick = async () => {
         + kv("当前代次", data.generation) + kv("状态", revoked ? "已撤销 revoked" : "可用 active")
         + kv("创建于", data.created_at) + "</div>";
       if (revoked) html += `<div class="kv reason" id="revocation-reason">撤销原因：${data.revocation_reason || "—"}</div>`;
+      html += `<div class="hint">值班员需从授权族详情进入
+        <a href="#" id="goto-chain" data-terminal="${encodeURIComponent(data.terminal_id)}"
+           style="color:var(--accent)">轮换链审计 →</a>
+        按发生顺序核对每一次轮换 / 撤销，而非仅凭当前代次推断。</div>`;
       show(el, html);
+      const link = $("goto-chain");
+      if (link) link.onclick = (ev) => {
+        ev.preventDefault();
+        $("terminal-chain").value = decodeURIComponent(link.dataset.terminal);
+        $("chain-btn").click();
+        $("chain-result").scrollIntoView({ behavior: "smooth", block: "center" });
+      };
     } else {
       show(el, `<span class="badge error">✖ 查询失败 HTTP ${status}</span><div class="kv">${kv("错误", data.error)}</div>`);
+    }
+  } catch (e) {
+    show(el, `<span class="badge error">✖ 网络错误</span><div class="kv">${kv("详情", String(e))}</div>`);
+  }
+};
+
+// ------------------------------------------------- ⑤ 轮换链审计
+const CHAIN_TYPE_LABEL = {
+  creation: "创建授权族",
+  rotation: "轮换",
+  revocation: "撤销",
+};
+
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function renderChain(d) {
+  const revoked = d.family_status === "revoked";
+  let html = "";
+  if (revoked) {
+    html += '<div class="chain-banner show" id="chain-invalidated">'
+      + '⛔ <strong>全链失效：授权族已撤销，此前所有代次凭证均不可用。</strong>'
+      + `<div class="kv"><span class="k">撤销原因：</span><span class="tag-reason">${esc(d.revocation_reason)}</span></div>`
+      + '</div>';
+  }
+  html += '<div class="chain-meta">'
+    + `授权族 <strong>${esc(d.family_id)}</strong> · 终端 <strong>${esc(d.terminal_id)}</strong>`
+    + ` · 当前代次 <strong>${esc(d.generation)}</strong>`
+    + ` · 状态 <strong>${revoked ? "已撤销 revoked" : "可用 active"}</strong>`
+    + ` · 链路记录 <strong>${(d.records || []).length}</strong> 条（重放不入链）</div>`;
+  html += '<ol class="timeline">';
+  for (const r of d.records || []) {
+    const isRevocation = r.type === "revocation";
+    let badge;
+    if (r.type === "creation") {
+      badge = '<span class="badge accepted">创建</span>';
+    } else if (r.type === "rotation" && r.status === "accepted") {
+      badge = '<span class="badge accepted">✔ 轮换 accepted</span>';
+    } else {
+      badge = '<span class="badge revoked">⛔ 撤销 revoked</span>';
+    }
+    let reuseTag = "";
+    if (r.reuse_trigger) {
+      reuseTag = '<span class="badge reuse">⚠ 异标识重用触发</span>';
+    }
+    html += `<li class="${isRevocation ? "revoked" : ""}">`
+      + `<div class="ev-head"><span class="seq">#${r.seq}</span>${badge}${reuseTag}`
+      + `<span>${esc(CHAIN_TYPE_LABEL[r.type] || r.type)}</span>`
+      + `<span class="ev-time">${esc(r.occurred_at)}</span></div>`
+      + '<div class="ev-body">'
+      + (r.rotation_id ? `轮换标识：<strong>${esc(r.rotation_id)}</strong><br>` : "")
+      + (r.old_credential_fingerprint
+          ? `前凭证指纹：<span class="fp">${esc(r.old_credential_fingerprint)}</span><br>` : "")
+      + (r.new_credential_fingerprint
+          ? `后凭证指纹：<span class="fp">${esc(r.new_credential_fingerprint)}</span><br>` : "")
+      + `结果代次：<strong>${esc(r.resulting_generation)}</strong> · 记录状态：<strong>${esc(r.status)}</strong>`
+      + (r.reason ? `<br><span class="tag-reason">原因：${esc(r.reason)}</span>` : "")
+      + "</div></li>";
+  }
+  html += "</ol>";
+  show($("chain-result"), html);
+}
+
+$("chain-btn").onclick = async () => {
+  const tid = $("terminal-chain").value.trim();
+  const el = $("chain-result");
+  try {
+    const { status, data } = await api("GET", "/api/terminals/" + encodeURIComponent(tid) + "/rotation-chain");
+    if (status === 200) {
+      renderChain(data);
+    } else {
+      show(el, `<span class="badge error">✖ 查询失败 HTTP ${status}</span>`
+        + `<div class="kv">${kv("错误", data.error === "unknown_terminal" ? "未知终端 unknown_terminal" : data.error)}</div>`
+        + '<div class="hint">未知终端不会返回任何链路数据：请先创建绑定该终端的授权族。</div>');
     }
   } catch (e) {
     show(el, `<span class="badge error">✖ 网络错误</span><div class="kv">${kv("详情", String(e))}</div>`);
