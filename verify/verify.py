@@ -104,7 +104,7 @@ def create_family(terminal):
 # ---------------------------------------------------------------- 单元测试
 
 def step_unit_tests():
-    print("\n== 1/6 代码单元测试 ==", flush=True)
+    print("\n== 1/7 代码单元测试 ==", flush=True)
     tests_dir = os.path.join(APP_DIR, "tests")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", tests_dir, "-v"],
@@ -118,7 +118,7 @@ def step_unit_tests():
 # ---------------------------------------------------------------- 冒烟
 
 def step_smoke():
-    print("\n== 2/6 API/HTTP 冒烟 ==", flush=True)
+    print("\n== 2/7 API/HTTP 冒烟 ==", flush=True)
     try:
         status, body = req("GET", "/health")
         record("GET /health 返回健康", status == 200 and body.get("status") == "ok",
@@ -147,7 +147,7 @@ def step_smoke():
 # ------------------------------------------------------- 场景 A：断回应恢复
 
 def step_disconnect_recovery():
-    print("\n== 3/6 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
+    print("\n== 3/7 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
     terminal = f"term-drop-{SFX}"
     rid = f"rot-drop-{SFX}"
     status, fam = create_family(terminal)
@@ -201,7 +201,7 @@ def step_disconnect_recovery():
 # ------------------------------------------------------- 场景 B：并发同标识
 
 def step_concurrent_same_id():
-    print("\n== 4/6 场景 B：两个并发相同请求 ==", flush=True)
+    print("\n== 4/7 场景 B：两个并发相同请求 ==", flush=True)
     terminal = f"term-conc-{SFX}"
     rid = f"rot-conc-{SFX}"
     status, fam = create_family(terminal)
@@ -237,7 +237,7 @@ def step_concurrent_same_id():
 # ------------------------------------------------- 场景 C：异标识重放 → 撤销
 
 def step_reuse_revocation():
-    print("\n== 5/6 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
+    print("\n== 5/7 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
     terminal = f"term-reuse-{SFX}"
     status, fam = create_family(terminal)
     if status != 201:
@@ -271,10 +271,118 @@ def step_reuse_revocation():
     record("状态查询可见撤销状态与原因", ok, f"HTTP {status}")
 
 
+# --------------------------------------------------- 场景 D：轮换链审计
+
+def chain_of(terminal):
+    return req("GET", f"/api/terminals/{terminal}/rotation-chain")
+
+
+def step_rotation_chain_audit():
+    print("\n== 6/7 场景 D：轮换链审计（创建/轮换/撤销记录、指纹脱敏、幂等不增项） ==", flush=True)
+
+    # 未知终端：明确的查询失败语义（404 unknown_terminal）。
+    status, body = chain_of(f"term-unknown-{SFX}")
+    record("轮换链：未知终端返回明确失败（404）",
+           status == 404 and body.get("error") == "unknown_terminal", f"HTTP {status} {body}")
+
+    terminal = f"term-chain-{SFX}"
+    rid1, rid2 = f"rot-chain-1-{SFX}", f"rot-chain-2-{SFX}"
+    status, fam = create_family(terminal)
+    if status != 201:
+        return record("场景D 前置：创建授权族", False, f"HTTP {status}")
+    cred0 = fam["credential"]
+
+    status, ch0 = chain_of(terminal)
+    ok = (status == 200 and ch0.get("length") == 1
+          and ch0["entries"][0]["type"] == "created"
+          and ch0["entries"][0]["result_generation"] == 1
+          and str(ch0["entries"][0]["result_credential_fp"]).startswith("sha256:"))
+    record("首轮换链：仅创建记录（代次 1，初始凭证指纹）", ok, f"HTTP {status}")
+
+    status, r1 = rotate(terminal, cred0, rid1)
+    cred1 = r1.get("credential")
+    status, r2 = rotate(terminal, cred1, rid2)
+    cred2 = r2.get("credential")
+
+    status, ch1 = chain_of(terminal)
+    entries = ch1.get("entries", [])
+    types = [e.get("type") for e in entries]
+    gens = [e.get("result_generation") for e in entries]
+    ok = (status == 200 and types == ["created", "rotated", "rotated"]
+          and gens == [1, 2, 3] and ch1.get("length") == 3
+          and not ch1.get("chain_invalidated"))
+    record("首轮换链：按发生顺序含创建 + 每次轮换，结果代次递增", ok,
+           f"HTTP {status} types={types} gens={gens}")
+
+    # 指纹：前后凭证均为不可逆指纹且前后衔接；绝不含可用凭证明文。
+    linked = (entries[1]["previous_credential_fp"] == entries[0]["result_credential_fp"]
+              and entries[2]["previous_credential_fp"] == entries[1]["result_credential_fp"])
+    fps = [e.get("previous_credential_fp") for e in entries[1:]] + \
+          [e.get("result_credential_fp") for e in entries]
+    fp_ok = linked and all(isinstance(f, str) and f.startswith("sha256:") for f in fps if f)
+    record("轮换记录含前后凭证不可逆指纹且前后衔接", fp_ok)
+
+    raw = json.dumps(ch1, ensure_ascii=False)
+    no_leak = cred0 not in raw and cred1 not in raw and cred2 not in raw
+    record("审计结果不泄露任何可用凭证（明文不出现）", no_leak)
+
+    # 幂等重放（含重启后）只回放既有结果，不新增审计记录、不改变链路顺序。
+    rotate(terminal, cred0, rid1)  # 同旧凭证 + 同标识重放
+    status, ch2 = chain_of(terminal)
+    record("同标识重放不新增审计记录、不改变链路顺序",
+           status == 200 and ch2.get("entries") == entries and ch2.get("length") == 3)
+
+    # 重启后重放：既有业务结果不变，链路仍无新增。
+    try:
+        req("POST", "/api/admin/shutdown")
+    except Exception:
+        pass
+    record("服务进程已退出（场景D 重启演练）", wait_down(15))
+    record("服务进程重启后恢复健康（场景D 重启演练）", wait_health(30))
+    status, replay = rotate(terminal, cred0, rid1)
+    replay_ok = (status == 200 and replay.get("outcome") == "replayed"
+                 and replay.get("credential") == cred1
+                 and replay.get("generation") == 2)
+    record("重启后幂等重放取回既有后继凭证与代次", replay_ok, f"HTTP {status}")
+    status, ch3 = chain_of(terminal)
+    record("重启后重放仍不新增审计记录、链路顺序不变",
+           status == 200 and ch3.get("entries") == entries and ch3.get("length") == 3,
+           f"HTTP {status}")
+
+    # 异标识重用触发撤销：撤销记录明确标记 + 全链失效。
+    status, revoked = rotate(terminal, cred0, f"rot-DIFFERENT-{SFX}")
+    record("异标识重用触发撤销（业务结果）",
+           status == 409 and revoked.get("outcome") == "revoked", f"HTTP {status}")
+
+    status, ch4 = chain_of(terminal)
+    ev = ch4.get("entries", [])
+    rev_entry = ev[-1] if ev else {}
+    ok = (status == 200 and ch4.get("chain_invalidated") is True
+          and ch4.get("family_status") == "revoked"
+          and rev_entry.get("type") == "revoked"
+          and rev_entry.get("reuse_trigger") is True
+          and rev_entry.get("chain_invalidated") is True
+          and rev_entry.get("original_rotation_id") == rid1
+          and rev_entry.get("attempted_rotation_id") == f"rot-DIFFERENT-{SFX}"
+          and "reuse" in (rev_entry.get("reason") or "")
+          and rev_entry.get("result_credential_fp") is None)
+    record("撤销记录明确标记异标识重用触发点", ok, f"HTTP {status}")
+
+    # 历史轮换条目随全链失效；撤销后任何重放不再新增记录。
+    hist_statuses = {e["result_generation"]: e["status"] for e in ev if e["type"] == "rotated"}
+    rotate(terminal, cred1, rid2)  # 撤销后重放旧请求
+    rotate(terminal, cred0, rid1)
+    status, ch5 = chain_of(terminal)
+    dead_ok = (hist_statuses.get(2) == "revoked" and hist_statuses.get(3) == "revoked"
+               and ch5.get("length") == ch4.get("length")
+               and ch5.get("chain_invalidated") is True)
+    record("全链失效标记 + 撤销后重放不新增审计记录", dead_ok, f"HTTP {status}")
+
+
 # ------------------------------------------------------- 页面可观察结果
 
 def step_page_observability():
-    print("\n== 6/6 页面可观察结果校验 ==", flush=True)
+    print("\n== 7/7 页面可观察结果校验 ==", flush=True)
     try:
         status, html = get_text("/")
     except Exception as e:
@@ -284,8 +392,9 @@ def step_page_observability():
     needles = [
         "深空地面站", "授权族", "终端标识", "轮换标识",
         "已接受", "重放", "已撤销", "撤销原因", "断回应",
+        "轮换链", "不可逆指纹", "全链", "异标识重用",
         'id="rotate-result"', 'id="revocation-reason"',
-        'id="create-result"', 'id="status-result"',
+        'id="create-result"', 'id="status-result"', 'id="chain-result"',
     ]
     missing = [n for n in needles if n not in html]
     record("页面呈现接受/重放/撤销等可观察元素", not missing,
@@ -317,6 +426,7 @@ def main():
         step_disconnect_recovery()
         step_concurrent_same_id()
         step_reuse_revocation()
+        step_rotation_chain_audit()
         step_page_observability()
 
     passed = sum(1 for _, ok in RESULTS if ok)

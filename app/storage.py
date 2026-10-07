@@ -38,6 +38,20 @@ CREATE TABLE IF NOT EXISTS rotations (
     created_at          TEXT NOT NULL,
     UNIQUE (family_id, old_credential_hash, rotation_id)  -- 幂等约束
 );
+
+-- 撤销事件：每次「实际改变授权族」的撤销落一条记录（异标识重用触发）。
+-- 审计链路凭此表在服务重启后仍能完整还原撤销点；重放请求不得追加记录。
+CREATE TABLE IF NOT EXISTS revocation_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    family_id             TEXT NOT NULL REFERENCES families(family_id),
+    terminal_id           TEXT NOT NULL,
+    reason                TEXT NOT NULL,
+    old_credential_hash   TEXT NOT NULL,              -- 被重用的已轮换凭证指纹
+    original_rotation_id  TEXT,                       -- 该凭证首次被消费时的轮换标识
+    attempted_rotation_id TEXT NOT NULL,              -- 触发撤销的异标识
+    generation            INTEGER NOT NULL,           -- 撤销时刻授权族代次（链路终止代次）
+    created_at            TEXT NOT NULL
+);
 """
 
 
@@ -152,8 +166,55 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_rotations(self, family_id):
+        """按发生顺序（id 自增）返回轮换记录，仅取审计安全列（不含后继凭证明文）。"""
+        rows = self._conn.execute(
+            "SELECT rotation_id, old_credential_hash, new_credential_hash,"
+            " new_generation, created_at"
+            " FROM rotations WHERE family_id = ? ORDER BY id ASC",
+            (family_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_credential_by_generation(self, family_id, generation):
+        row = self._conn.execute(
+            "SELECT * FROM credentials WHERE family_id = ? AND generation = ?",
+            (family_id, generation),
+        ).fetchone()
+        return dict(row) if row else None
+
     def count_rotations(self, family_id):
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM rotations WHERE family_id = ?", (family_id,)
+        ).fetchone()
+        return row["n"]
+
+    # ---- revocation events ----
+
+    def insert_revocation_event(self, family_id, terminal_id, reason,
+                                old_credential_hash, original_rotation_id,
+                                attempted_rotation_id, generation, created_at):
+        self._conn.execute(
+            "INSERT INTO revocation_events (family_id, terminal_id, reason,"
+            " old_credential_hash, original_rotation_id, attempted_rotation_id,"
+            " generation, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (family_id, terminal_id, reason, old_credential_hash,
+             original_rotation_id, attempted_rotation_id, generation, created_at),
+        )
+
+    def list_revocation_events(self, family_id):
+        rows = self._conn.execute(
+            "SELECT reason, old_credential_hash, original_rotation_id,"
+            " attempted_rotation_id, generation, created_at"
+            " FROM revocation_events WHERE family_id = ? ORDER BY id ASC",
+            (family_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_revocation_events(self, family_id):
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM revocation_events WHERE family_id = ?",
+            (family_id,),
         ).fetchone()
         return row["n"]

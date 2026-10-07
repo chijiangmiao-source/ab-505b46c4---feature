@@ -154,12 +154,21 @@ def _rotate_once(db, terminal_id, credential, rotation_id):
         }
 
     # 相同旧凭证 + 不同轮换标识 => 凭证重用，撤销整个授权族。
+    original_rotation_id = rotation["rotation_id"] if rotation else None
     reason = (
         f"{REASON_REUSE}: rotated credential of terminal '{terminal_id}' "
         f"presented again with a different rotation id"
     )
+    now = _now()
     db.revoke_family(family["family_id"], reason)
     db.revoke_all_credentials(family["family_id"])
+    # 撤销是一次「实际改变授权族」的事件，须进入轮换链；记录被重用凭证指纹、
+    # 原轮换标识与触发撤销的异标识，便于值班员定位重用点。
+    db.insert_revocation_event(
+        family["family_id"], terminal_id, reason,
+        cred_hash, original_rotation_id, rotation_id,
+        family["generation"], now,
+    )
     return _revoked_result({
         **family,
         "status": STATUS_REVOKED,
@@ -201,4 +210,112 @@ def _revoked_result(family):
         "generation": family["generation"],
         "family_status": STATUS_REVOKED,
         "revocation_reason": family["revocation_reason"],
+    }
+
+
+def _fingerprint(cred_hash):
+    """审计用指纹：仅展示哈希前若干位，哈希本身不可逆，可用凭证无法据此还原。"""
+    return "sha256:" + cred_hash[:12]
+
+
+def get_rotation_chain(storage, terminal_id):
+    """按代次/发生顺序返回某终端授权族的完整轮换链审计视图。
+
+    链路条目（按发生顺序）：
+      - 创建记录（type=created）：代次 1 初始凭证指纹；
+      - 每次实际改变授权族的轮换记录（type=rotated）：前/后凭证不可逆指纹、
+        稳定轮换标识、结果代次、状态、原因；
+      - 撤销记录（type=revoked）：异标识重用触发，标记触发重用的轮换标识、
+        全链失效。
+
+    审计结果只含不可逆指纹，绝不返回任何可用凭证明文。
+    幂等重放不产生轮换/撤销记录，因此链路长度不因重放（含重启后）而变化。
+    """
+    terminal_id = (terminal_id or "").strip()
+    _validate(terminal_id)
+    with storage.transaction() as db:
+        family = db.find_family_by_terminal(terminal_id)
+        if not family:
+            raise UnknownTerminalError(terminal_id)
+        return _build_chain(db, family)
+
+
+def _build_chain(db, family):
+    family_id = family["family_id"]
+    terminal_id = family["terminal_id"]
+    revoked = family["status"] == STATUS_REVOKED
+
+    entries = []
+
+    # ① 创建记录：代次 1 的初始凭证指纹（凭据哈希不可逆，不含明文）。
+    initial = db.find_credential_by_generation(family_id, 1)
+    entries.append({
+        "seq": 1,
+        "type": "created",
+        "terminal_id": terminal_id,
+        "rotation_id": None,
+        "previous_credential_fp": None,
+        "result_credential_fp": _fingerprint(initial["credential_hash"]) if initial else None,
+        "result_generation": 1,
+        "status": "active",
+        "reason": "family_created",
+        "created_at": family["created_at"],
+    })
+
+    # ② 每一次实际改变授权族的轮换记录（按发生顺序；重放不入库，故不在此出现）。
+    rotations = db.list_rotations(family_id)
+    chain_dead = False
+    for idx, rot in enumerate(rotations, start=2):
+        # 撤销之后，此前链路上的凭证全部连带失效：撤销点之后不再有合法轮换，
+        # 现有轮换条目若发生在撤销时刻代次之前，其结果凭证随全链失效而不可用。
+        entries.append({
+            "seq": idx,
+            "type": "rotated",
+            "terminal_id": terminal_id,
+            "rotation_id": rot["rotation_id"],
+            "previous_credential_fp": _fingerprint(rot["old_credential_hash"]),
+            "result_credential_fp": _fingerprint(rot["new_credential_hash"]),
+            "result_generation": rot["new_generation"],
+            # 授权族撤销后，全链凭证均失效，历史轮换结果凭证标记为失效。
+            "status": "revoked" if revoked else "active",
+            "reason": "rotated" if not revoked else "invalidated_by_family_revocation",
+            "created_at": rot["created_at"],
+        })
+
+    # ③ 撤销记录（异标识重用触发）：标记触发点与全链失效。
+    for rev in db.list_revocation_events(family_id):
+        chain_dead = True
+        entries.append({
+            "seq": len(entries) + 1,
+            "type": "revoked",
+            "terminal_id": terminal_id,
+            "rotation_id": rev["attempted_rotation_id"],
+            "previous_credential_fp": _fingerprint(rev["old_credential_hash"]),
+            "result_credential_fp": None,
+            "result_generation": rev["generation"],
+            "status": STATUS_REVOKED,
+            "reason": rev["reason"],
+            "reuse_trigger": True,
+            "original_rotation_id": rev["original_rotation_id"],
+            "attempted_rotation_id": rev["attempted_rotation_id"],
+            "chain_invalidated": True,
+            "created_at": rev["created_at"],
+        })
+
+    # 撤销记录与轮换记录按各自表内自增 id 排序后，可能在边界处交错；
+    # 实际语义上撤销必发生在末轮换之后，这里以 created_at + seq 兜底稳定排序。
+    entries.sort(key=lambda e: (e["created_at"], e["seq"]))
+    for i, e in enumerate(entries, start=1):
+        e["seq"] = i
+
+    return {
+        "family_id": family_id,
+        "terminal_id": terminal_id,
+        "family_status": family["status"],
+        "generation": family["generation"],
+        "revocation_reason": family["revocation_reason"],
+        "chain_invalidated": revoked,
+        "reuse_triggered": chain_dead,
+        "length": len(entries),
+        "entries": entries,
     }

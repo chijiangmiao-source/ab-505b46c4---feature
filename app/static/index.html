@@ -53,6 +53,20 @@
   .hint { font-size: 12px; color: var(--dim); margin-top: 10px; line-height: 1.6; }
   .fault-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 13px; }
   #fault-state { font-size: 12px; color: var(--dim); }
+  .chain { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .chain-entry { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: rgba(0,0,0,.18); font-size: 12px; }
+  .chain-entry.dead { border-color: var(--bad); background: rgba(248,113,113,.08); }
+  .chain-entry .seq { color: var(--dim); margin-right: 8px; }
+  .chain-entry .fp { color: var(--accent); word-break: break-all; }
+  .chain-entry .tag { font-weight: 700; }
+  .chain-entry .tag.created { color: var(--ok); }
+  .chain-entry .tag.rotated { color: var(--replay); }
+  .chain-entry .tag.revoked { color: var(--bad); }
+  .chain-entry .meta { color: var(--dim); margin-top: 4px; line-height: 1.7; }
+  .chain-banner { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; font-weight: 700; }
+  .chain-banner.ok { color: var(--ok); border: 1px solid var(--ok); background: rgba(74,222,128,.08); }
+  .chain-banner.dead { color: var(--bad); border: 1px solid var(--bad); background: rgba(248,113,113,.08); }
+  .chain-banner .reuse { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -90,11 +104,26 @@
     <label for="terminal-status">终端标识 terminal_id</label>
     <input type="text" id="terminal-status" placeholder="terminal-alpha-01">
     <button id="status-btn">查询状态</button>
+    <button id="status-to-chain">查看轮换链 →</button>
     <div class="result" id="status-result"></div>
   </section>
 
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>④ 轮换链审计（从授权族详情进入）</h2>
+    <label for="terminal-chain">终端标识 terminal_id</label>
+    <input type="text" id="terminal-chain" placeholder="terminal-alpha-01">
+    <button id="chain-btn">查询轮换链</button>
+    <div class="result" id="chain-result"></div>
+    <div class="hint">
+      按发生顺序展示<strong>创建记录</strong>及每一次实际改变授权族的<strong>轮换 / 撤销</strong>记录：
+      含前后凭证的不可逆指纹、稳定轮换标识、结果代次、状态与原因；
+      审计结果<strong>不含任何可用凭证</strong>。异标识重用触发的记录将明确标记，撤销后全链标记为失效。
+      幂等重放（含服务重启后）不会新增链路记录。
+    </div>
+  </section>
+
   <section class="card">
-    <h2>④ 故障注入（演练）</h2>
+    <h2>⑤ 故障注入（演练）</h2>
     <div class="fault-row">
       <label style="margin:0" for="fault-drop">断回应（提交后断连，不送达响应）</label>
       <input type="checkbox" id="fault-drop">
@@ -210,6 +239,77 @@ $("status-btn").onclick = async () => {
         + kv("创建于", data.created_at) + "</div>";
       if (revoked) html += `<div class="kv reason" id="revocation-reason">撤销原因：${data.revocation_reason || "—"}</div>`;
       show(el, html);
+    } else {
+      show(el, `<span class="badge error">✖ 查询失败 HTTP ${status}</span><div class="kv">${kv("错误", data.error)}</div>`);
+    }
+  } catch (e) {
+    show(el, `<span class="badge error">✖ 网络错误</span><div class="kv">${kv("详情", String(e))}</div>`);
+  }
+};
+
+$("status-to-chain").onclick = () => {
+  const tid = $("terminal-status").value.trim();
+  $("terminal-chain").value = tid;
+  if (tid) $("chain-btn").click();
+};
+
+const CHAIN_TAG = {
+  created: '<span class="tag created">创建</span>',
+  rotated: '<span class="tag rotated">轮换</span>',
+  revoked: '<span class="tag revoked">⛔ 撤销 · 异标识重用触发</span>',
+};
+
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderChain(data) {
+  let html = "";
+  if (data.chain_invalidated) {
+    html += '<div class="chain-banner dead">⛔ 全链已失效 chain invalidated'
+      + ' — <span class="reuse">异标识重用触发撤销</span></div>';
+  } else {
+    html += '<div class="chain-banner ok">● 授权族可用（全链有效）</div>';
+  }
+  html += '<div class="kv">'
+    + kv("授权族", data.family_id) + kv("终端标识", data.terminal_id)
+    + kv("当前代次", data.generation)
+    + kv("状态", data.chain_invalidated ? "已撤销 revoked" : "可用 active")
+    + kv("记录数", data.length) + "</div>";
+  if (data.chain_invalidated && data.revocation_reason) {
+    html += `<div class="kv reason">撤销原因：${esc(data.revocation_reason)}</div>`;
+  }
+  html += '<div class="chain">';
+  for (const e of (data.entries || [])) {
+    const dead = e.chain_invalidated || (e.status === "revoked" && e.type === "rotated") ? " dead" : "";
+    html += `<div class="chain-entry${dead}">`;
+    html += `<div><span class="seq">#${e.seq}</span>${CHAIN_TAG[e.type] || esc(e.type)}`;
+    if (e.rotation_id) html += ` <span class="meta">轮换标识：${esc(e.rotation_id)}</span>`;
+    html += "</div>";
+    html += '<div class="meta">';
+    html += `前凭证指纹：<span class="fp">${e.previous_credential_fp ? esc(e.previous_credential_fp) : "—（创建无前置）"}</span><br>`;
+    html += `结果凭证指纹：<span class="fp">${e.result_credential_fp ? esc(e.result_credential_fp) : "—（撤销不签发）"}</span><br>`;
+    html += `结果代次：${e.result_generation}　状态：${e.status === "active" ? "可用 active" : "已撤销 revoked"}<br>`;
+    html += `原因：${esc(e.reason)}　时间：${esc(e.created_at)}`;
+    if (e.type === "revoked") {
+      html += `<br><strong style="color:var(--warn)">异标识重用：</strong>原轮换标识 `
+        + `${esc(e.original_rotation_id)} → 触发标识 ${esc(e.attempted_rotation_id)}`;
+    }
+    html += "</div></div>";
+  }
+  html += "</div>";
+  return html;
+}
+
+$("chain-btn").onclick = async () => {
+  const tid = $("terminal-chain").value.trim();
+  const el = $("chain-result");
+  if (!tid) { show(el, '<span class="badge error">✖ 请输入终端标识</span>'); return; }
+  try {
+    const { status, data } = await api("GET", "/api/terminals/" + encodeURIComponent(tid) + "/rotation-chain");
+    if (status === 200) {
+      show(el, renderChain(data));
     } else {
       show(el, `<span class="badge error">✖ 查询失败 HTTP ${status}</span><div class="kv">${kv("错误", data.error)}</div>`);
     }

@@ -154,6 +154,100 @@ class RotationTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.rotate(self.storage, "term-1", "", "rot-1")
 
+    # ---- 轮换链审计 ----
+
+    def _chain(self, terminal="term-1"):
+        return service.get_rotation_chain(self.storage, terminal)
+
+    def test_chain_fresh_family_has_only_created_entry(self):
+        fam = self._family()
+        chain = self._chain()
+        self.assertEqual(chain["family_status"], "active")
+        self.assertFalse(chain["chain_invalidated"])
+        self.assertEqual(chain["length"], 1)
+        entry = chain["entries"][0]
+        self.assertEqual(entry["type"], "created")
+        self.assertEqual(entry["result_generation"], 1)
+        self.assertTrue(entry["result_credential_fp"].startswith("sha256:"))
+        self.assertIsNone(entry["previous_credential_fp"])
+
+    def test_chain_records_each_rotation_in_order_with_fingerprints(self):
+        fam = self._family()
+        r1 = service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        r2 = service.rotate(self.storage, "term-1", r1["credential"], "rot-2")
+        chain = self._chain()
+        self.assertEqual(chain["length"], 3)
+        types = [e["type"] for e in chain["entries"]]
+        self.assertEqual(types, ["created", "rotated", "rotated"])
+        gens = [e["result_generation"] for e in chain["entries"]]
+        self.assertEqual(gens, [1, 2, 3])
+        # 稳定轮换标识随记录可见；前后凭证均为不可逆指纹。
+        self.assertEqual(chain["entries"][1]["rotation_id"], "rot-1")
+        self.assertEqual(chain["entries"][2]["rotation_id"], "rot-2")
+        for e in chain["entries"][1:]:
+            self.assertTrue(e["previous_credential_fp"].startswith("sha256:"))
+            self.assertTrue(e["result_credential_fp"].startswith("sha256:"))
+            self.assertEqual(e["status"], "active")
+        # 相邻条目：上一条的结果指纹 == 下一条的前凭证指纹。
+        self.assertEqual(chain["entries"][1]["result_credential_fp"],
+                         chain["entries"][2]["previous_credential_fp"])
+
+    def test_chain_never_exposes_usable_credentials(self):
+        fam = self._family()
+        r1 = service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        blob = repr(self._chain())
+        self.assertNotIn(fam["credential"], blob)
+        self.assertNotIn(r1["credential"], blob)
+
+    def test_chain_replay_does_not_add_entries(self):
+        fam = self._family()
+        service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        before = self._chain()
+        for _ in range(3):
+            service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        after = self._chain()
+        self.assertEqual(after["length"], before["length"])
+        self.assertEqual(after["entries"], before["entries"])
+
+    def test_chain_replay_after_restart_adds_no_entries_and_keeps_order(self):
+        fam = self._family()
+        first = service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        self.storage.close()
+        self.storage = Storage(self.db_path)  # 模拟服务重启
+        again = service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        self.assertEqual(again["outcome"], "replayed")
+        chain = self._chain()
+        self.assertEqual(chain["length"], 2)  # 仅创建 + 首轮换，重放不产生记录
+        self.assertEqual([e["type"] for e in chain["entries"]], ["created", "rotated"])
+        self.assertEqual(chain["entries"][1]["rotation_id"], "rot-1")
+        self.assertEqual(chain["entries"][1]["result_generation"], first["generation"])
+
+    def test_chain_marks_reuse_revocation_and_full_chain_invalidated(self):
+        fam = self._family()
+        service.rotate(self.storage, "term-1", fam["credential"], "rot-1")
+        service.rotate(self.storage, "term-1", fam["credential"], "rot-DIFFERENT")
+        chain = self._chain()
+        self.assertTrue(chain["chain_invalidated"])
+        self.assertTrue(chain["reuse_triggered"])
+        self.assertEqual(chain["family_status"], "revoked")
+        # 末尾为撤销记录，明确标记异标识重用触发。
+        rev = chain["entries"][-1]
+        self.assertEqual(rev["type"], "revoked")
+        self.assertTrue(rev["reuse_trigger"])
+        self.assertTrue(rev["chain_invalidated"])
+        self.assertEqual(rev["original_rotation_id"], "rot-1")
+        self.assertEqual(rev["attempted_rotation_id"], "rot-DIFFERENT")
+        self.assertIsNone(rev["result_credential_fp"])
+        self.assertIn("reuse", rev["reason"])
+        # 历史轮换条目状态随全链失效。
+        self.assertEqual(chain["entries"][1]["status"], "revoked")
+        # 撤销链路依旧不含任何可用凭证明文。
+        self.assertNotIn(fam["credential"], repr(chain))
+
+    def test_chain_unknown_terminal_is_clear_failure(self):
+        with self.assertRaises(service.UnknownTerminalError):
+            service.get_rotation_chain(self.storage, "no-such-terminal")
+
 
 if __name__ == "__main__":
     unittest.main()
